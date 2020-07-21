@@ -1,0 +1,333 @@
+#include <hash.h>
+#include <string.h>
+#include "lib/kernel/hash.h"
+
+#include "threads/synch.h"
+#include "threads/malloc.h"
+#include "threads/palloc.h"
+#include "threads/vaddr.h"
+#include "userprog/pagedir.h"
+#include "vm/page.h"
+#include "vm/frame.h"
+#include "filesys/file.h"
+
+static unsigned hash_func(const struct hash_elem *elem, void *aux);
+static bool     cmp_func(const struct hash_elem *, const struct hash_elem *, void *aux);
+static void     des_func(struct hash_elem *elem, void *aux);
+static bool 	pgtab_loadpage_from_filesys(struct page_tab_ent *, void *);
+
+struct page_table* pgtab_create (void){
+  struct page_table *pgtab =(struct page_table*) malloc(sizeof(struct page_table));
+  hash_init (&pgtab->page_map, hash_func, cmp_func, NULL);
+  return pgtab;
+}
+
+void pgtab_destroy (struct page_table *pgtab){
+  ASSERT (pgtab != NULL);
+  hash_destroy (&pgtab->page_map, des_func);
+  free (pgtab);
+  	//删除哈希表 free页表
+}
+
+
+//安装一个页面（由起始地址`upage`指定）当前位于补充页面表格的框架中。如果成功则返回true，否则返回false。如果发生故障，in process.c
+bool pgtab_loadframe (struct page_table *pgtab, void *upage, void *kpage){
+  struct page_tab_ent *pgtent;
+  pgtent = (struct page_tab_ent *) malloc(sizeof(struct page_tab_ent));
+
+  pgtent->upage = upage;
+  pgtent->kpage = kpage;
+  pgtent->status = ON_FRAME;
+  pgtent->dirty = false;
+  pgtent->index = -1;
+
+  struct hash_elem *prev_elem;
+  prev_elem = hash_insert (&pgtab->page_map, &pgtent->elem);
+  if (prev_elem == NULL) {
+    //成功插入页表。
+    return true;
+  }
+  else {
+	
+    free (pgtent);
+    return false;
+  }
+}
+
+//安装新的页面（由地址upage指定）在补充页面表上。 该页面的类型为ALL_ZERO，表示所有字节都是（懒惰）为零。 in exception.c 
+bool pgtab_loadzpage (struct page_table *pgtab, void *upage){
+  struct page_tab_ent *pgtent;
+  pgtent = (struct page_tab_ent *) malloc(sizeof(struct page_tab_ent));
+
+  pgtent->upage = upage;
+  pgtent->kpage = NULL;
+  pgtent->status = ALL_ZERO;
+  pgtent->dirty = false;
+
+  struct hash_elem *prev_elem;
+  prev_elem = hash_insert (&pgtab->page_map, &pgtent->elem);
+  if (prev_elem == NULL) return true;
+
+  PANIC("Duplicated pgtab entry for zeropage");
+  return false;
+}
+//页片从用户态切换到和心态更新索引
+bool pgtab_setswap (struct page_table *pgtab, void *page, index_swap index){
+  struct page_tab_ent *pgtent;
+  pgtent = pgtab_lookup(pgtab, page);
+  if(pgtent == NULL) return false;
+
+  pgtent->status = ON_SWAP;
+  pgtent->kpage = NULL;
+  pgtent->index = index;
+  return true;
+}
+
+
+//从文件系统中载入新的页表
+bool pgtab_loadfilesys (struct page_table *pgtab, void *upage,struct file * file, off_t offset, uint32_t read_bytes, uint32_t zero_bytes, bool writable){
+  struct page_tab_ent *pgtent;
+  pgtent = (struct page_tab_ent *) malloc(sizeof(struct page_tab_ent));
+
+  pgtent->upage = upage;
+  pgtent->kpage = NULL;
+  pgtent->status = FROM_FILESYS;
+  pgtent->dirty = false;
+  pgtent->file = file;
+  pgtent->offset = offset;
+  pgtent->read_bytes = read_bytes;
+  pgtent->zero_bytes = zero_bytes;
+  pgtent->writable = writable;
+
+  struct hash_elem *prev_elem;
+  prev_elem = hash_insert (&pgtab->page_map, &pgtent->elem);
+  if (prev_elem == NULL) return true;
+
+  // there is already an entry -- impossible state
+  PANIC("Duplicated pgtab entry for filesys-page");
+  return false;
+}
+
+
+struct page_tab_ent* pgtab_lookup (struct page_table *pgtab, void *page){
+
+  struct page_tab_ent pgtent_temp;
+  pgtent_temp.upage = page;
+
+  struct hash_elem *elem = hash_find (&pgtab->page_map, &pgtent_temp.elem);
+  if(elem == NULL) return NULL;
+  return hash_entry(elem, struct page_tab_ent, elem);
+}
+
+bool pgtab_entry (struct page_table *pgtab, void *page){
+  
+  struct page_tab_ent *pgtent = pgtab_lookup(pgtab, page);
+  if(pgtent == NULL) return false;
+
+  return true;
+}
+
+bool pglab_setdirty (struct page_table *pgtab, void *page, bool value){
+  struct page_tab_ent *pgtent = pgtab_lookup(pgtab, page);
+  if (pgtent == NULL) PANIC("set dirty - the request page doesn't exist");
+
+  pgtent->dirty = pgtent->dirty || value;
+  return true;
+}
+
+
+
+bool pgtab_loadpage(struct page_table *pgtab, uint32_t *pagedir, void *upage){
+  // 1. 内存是否满
+  struct page_tab_ent *pgtent;
+  pgtent = pgtab_lookup(pgtab, upage);
+  if(pgtent == NULL) {
+    return false;
+  }
+
+  if(pgtent->status == ON_FRAME) {
+
+    return true;
+  }
+  // 2.获取页表的框架
+  void *frame_page = frame_allocate(PAL_USER, upage);
+  if(frame_page == NULL) {
+    return false;
+  }
+
+  // 3. 装入数据
+  bool writable = true;
+  switch (pgtent->status)
+  {
+  case ALL_ZERO:
+    memset (frame_page, 0, PGSIZE);
+    break;
+
+  case ON_FRAME:
+
+    break;
+
+  case ON_SWAP:
+    vm_swap_in (pgtent->index, frame_page);
+    break;
+
+  case FROM_FILESYS:
+    if( pgtab_loadpage_from_filesys(pgtent, frame_page) == false) {
+      frame_free(frame_page);
+      return false;
+    }
+
+    writable = pgtent->writable;
+    break;
+
+  default:
+    PANIC ("unreachable state");
+  }
+
+  // 4. 虚拟地址指向物理地址
+  if(!pagedir_set_page (pagedir, upage, frame_page, writable)) {
+    frame_free(frame_page);
+    return false;
+  }
+
+  //内核态更新
+  pgtent->kpage = frame_page;
+  pgtent->status = ON_FRAME;
+
+  pagedir_set_dirty (pagedir, frame_page, false);
+
+  //解锁框架
+  vm_frame_unpin(frame_page);
+
+  return true;
+}
+
+bool pgtab_mm_unmap(struct page_table *pgtab, uint32_t *pagedir,void *page, struct file *f, off_t offset, size_t bytes){
+  struct page_tab_ent *pgtent = pgtab_lookup(pgtab, page);
+  if(pgtent == NULL) {
+    PANIC ("munmap - some page is missing; can't happen!");
+  }
+
+  // 锁定页，
+  if (pgtent->status == ON_FRAME) {
+    ASSERT (pgtent->kpage != NULL);
+    frame_hook (pgtent->kpage);
+  }
+
+
+  // 大致流程类似loadpage
+  switch (pgtent->status)
+  {
+  case ON_FRAME:
+    ASSERT (pgtent->kpage != NULL);
+
+    // 脏帧处理（写入文件）
+     //检查升级或映射帧是否脏。 如果是，请写入文件。
+    bool is_dirty = pgtent->dirty;
+    is_dirty = is_dirty || pagedir_is_dirty(pagedir, pgtent->upage);
+    is_dirty = is_dirty || pagedir_is_dirty(pagedir, pgtent->kpage);
+    if(is_dirty) {
+      file_write_at (f, pgtent->upage, bytes, offset);
+    }
+
+    //清理映射
+    frame_free (pgtent->kpage);
+    pagedir_clear_page (pagedir, pgtent->upage);
+    break;
+
+  case ON_SWAP:
+    {
+      bool is_dirty = pgtent->dirty;
+      is_dirty = is_dirty || pagedir_is_dirty(pagedir, pgtent->upage);
+      if (is_dirty) {
+        // 从交换区加载，并写回文件
+        void *tmp_page = palloc_get_page(0); 
+        vm_swap_in (pgtent->index, tmp_page);
+        file_write_at (f, tmp_page, PGSIZE, offset);
+        palloc_free_page(tmp_page);
+      }
+      else {
+        vm_swap_free (pgtent->index);
+      }
+    }
+    break;
+
+  case FROM_FILESYS://这个状态下前面已经与文件接触绑定 所以并不需要文件处理
+    break;
+
+  default:
+   
+    PANIC ("unreachable state");
+  }
+
+  // 最后从哈希表中删除数据
+  hash_delete(& pgtab->page_map, &pgtent->elem);
+  return true;
+}
+
+
+static bool pgtab_loadpage_from_filesys(struct page_tab_ent *pgtent, void *kpage)
+{
+  file_seek (pgtent->file, pgtent->offset);
+
+  //读取文件内容
+  int n_read = file_read (pgtent->file, kpage, pgtent->read_bytes);
+  if(n_read != (int)pgtent->read_bytes)
+    return false;
+
+  // remain bytes are just zero
+  ASSERT (pgtent->read_bytes + pgtent->zero_bytes == PGSIZE);
+  memset (kpage + n_read, 0, pgtent->zero_bytes);
+  return true;
+}
+
+
+
+void pgtab_hook(struct page_table *pgtab, void *page){
+  struct page_tab_ent *pgtent;
+  pgtent = pgtab_lookup(pgtab, page);
+  if(pgtent == NULL) {
+    return;
+  }
+
+  ASSERT (pgtent->status == ON_FRAME);
+  frame_hook (pgtent->kpage);
+}
+
+
+void pgtab_unhook(struct page_table *pgtab, void *page){
+  struct page_tab_ent *pgtent;
+  pgtent = pgtab_lookup(pgtab, page);
+  if(pgtent == NULL) PANIC ("request page is't exist");
+
+  if (pgtent->status == ON_FRAME) {
+    frame_unhook (pgtent->kpage);
+  }
+}
+
+
+
+static unsigned hash_func(const struct hash_elem *elem, void *aux UNUSED){
+  struct page_tab_ent *entry = hash_entry(elem, struct page_tab_ent, elem);
+  return hash_int( (int)entry->upage );
+}
+static bool cmp_func(const struct hash_elem *a, const struct hash_elem *b, void *aux UNUSED){
+  struct page_tab_ent *a_entry = hash_entry(a, struct page_tab_ent, elem);
+  struct page_tab_ent *b_entry = hash_entry(b, struct page_tab_ent, elem);
+  return a_entry->upage < b_entry->upage;
+}
+static void des_func(struct hash_elem *elem, void *aux UNUSED){
+  struct page_tab_ent *entry = hash_entry(elem, struct page_tab_ent, elem);
+
+  // Clean up the associated frame
+  if (entry->kpage != NULL) {
+    ASSERT (entry->status == ON_FRAME);
+    frame_remove (entry->kpage);
+  }
+  else if(entry->status == ON_SWAP) {
+    vm_swap_free (entry->index);
+  }
+
+  // Clean up pgtent entry.
+  free (entry);
+}
